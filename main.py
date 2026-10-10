@@ -5,12 +5,11 @@ import yfinance as yf
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
+# Keep Render alive
 _flask_app = Flask(__name__)
 @_flask_app.route('/')
 def home(): return "Bot Running!"
-def _run_web():
-    _flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
-threading.Thread(target=_run_web, daemon=True).start()
+threading.Thread(target=lambda: _flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 FILE = "stocks.json"
@@ -27,17 +26,18 @@ def save_db(d):
 
 def get_data(sym):
     try:
-        s = sym.strip().upper() # any case
-        h = yf.Ticker(f"{s}.NS").history(period="2d")
-        if h.empty: return None
-        ltp = float(h['Close'].iloc[-1])
-        prev = float(h['Close'].iloc[-2]) if len(h)>1 else ltp
+        s = sym.strip().upper() # FIX: exideind / EXIDEIND / ExideInd all work
+        hist = yf.Ticker(f"{s}.NS").history(period="5d")
+        if hist.empty: return None
+        ltp = float(hist['Close'].iloc[-1])
+        prev = float(hist['Close'].iloc[-2]) if len(hist)>1 else ltp
         chg = ((ltp-prev)/prev*100) if prev else 0
         return {"sym": s, "ltp": ltp, "chg": chg}
     except:
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # OLD STYLE Sept 5 exactly
     await update.message.reply_text("Bot Ready! 📈")
     kb = [[InlineKeyboardButton("📋 Watchlist Menu", callback_data="watchlist")]]
     await update.message.reply_text("📋 Watchlist Menu", reply_markup=InlineKeyboardMarkup(kb))
@@ -46,20 +46,18 @@ async def show_positions(obj, uid, edit=False):
     db = load_db()
     stocks = db.get(uid, [])
     if not stocks:
-        txt = "No stocks. Tap ➕ Add New Stock"
+        txt = "No stocks yet. Tap ➕ Add New Stock"
         if edit: await obj.edit_message_text(txt)
         else: await obj.reply_text(txt)
         return
-    rows = []
-    for sym in stocks:
-        d = get_data(sym)
-        if d: rows.append(d)
+    rows = [get_data(s) for s in stocks]
+    rows = [r for r in rows if r]
     rows.sort(key=lambda x: x['chg'], reverse=True)
     btns = []
     for r in rows:
         dot = "🔵" if r['chg'] >= 0 else "🔴"
         btns.append([
-            InlineKeyboardButton(f"{dot} {r['sym']} {r['ltp']:.2f} {r['chg']:+.2f}%", callback_data="noop"),
+            InlineKeyboardButton(f"{dot} {r['sym']} {r['ltp']:.2f} {r['chg']:+.1f}%", callback_data="noop"),
             InlineKeyboardButton("📈", callback_data=f"chart_{r['sym']}"),
             InlineKeyboardButton("❌", callback_data=f"del_{r['sym']}")
         ])
@@ -81,16 +79,13 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ["Active Alerts", "⏰ Active Alerts"]:
         await update.message.reply_text("⏰ Active Alerts - Coming soon")
         return
-    if text == "➕ Add New Stock":
-        waiting.add(uid)
-        await update.message.reply_text("➕ Add New Stock\nSend like: HDFC, TCS\n(Any case: exideind, EXIDEIND)")
-        return
 
-    # FIX:, and ; support - comma suggested
-    if uid in waiting or "," in text or ";" in text or text.replace(" ", "").replace(",", "").replace(";", "").isalnum():
+    # FIX:, and ; both supported, comma suggested
+    if uid in waiting or "," in text or ";" in text or len(text) <= 30:
         if uid in waiting: waiting.discard(uid)
-        raw = text.replace(';', ',')
-        symbols = [s.strip().upper() for s in raw.split(',') if s.strip()]
+        raw = text.replace(';', ',') # accept both ; and,
+        symbols = [s.strip().upper() for s in raw.split(',') if s.strip()] # any case + comma split
+        if not symbols: return
         if uid not in db: db[uid] = []
         added, failed = [], []
         for sym in symbols:
@@ -105,8 +100,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rep = ""
         if added: rep += f"✅ Added: {', '.join(added)}\n"
         if failed: rep += f"❌ Failed: {', '.join(failed)}"
-        await update.message.reply_text(rep or "❌ No valid")
-        return
+        await update.message.reply_text(rep or "❌ No valid symbols")
 
 async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -116,7 +110,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
 
     if data == "watchlist":
-        # THIS WAS BROKEN - NOW FIXED - shows Active Alerts
+        # THIS IS YOUR OLD STYLE WITH ACTIVE ALERTS - RESTORED
         kb = [
             [InlineKeyboardButton("📈 My Positions", callback_data="mypos"),
              InlineKeyboardButton("⏰ Active Alerts", callback_data="alerts")],
@@ -128,11 +122,11 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_positions(q, uid, True)
 
     elif data == "alerts":
-        await q.message.reply_text("⏰ Active Alerts - No alerts set yet")
+        await q.message.reply_text("⏰ Active Alerts - No alerts yet")
 
     elif data == "add":
         waiting.add(uid)
-        await q.message.reply_text("➕ Add New Stock\nSend symbols like: HDFC, TCS or HDFC; TCS")
+        await q.message.reply_text("➕ Add New Stock\nSend like: HDFC, TCS or HDFC; TCS")
 
     elif data == "noop":
         return
@@ -148,12 +142,12 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = data[6:]
         d = get_data(sym)
         if d:
-            await q.message.reply_text(f"📈 {sym}: {d['ltp']:.2f} ({d['chg']:+.2f}%)")
+            await q.message.reply_text(f"📈 {sym}: {d['ltp']:.2f} ({d['chg']:+.1f}%)")
 
 if __name__ == '__main__':
+    print("OLD STYLE + ACTIVE ALERTS RESTORED")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    print("OLD STYLE RESTORED with Active Alerts")
     app.run_polling()
