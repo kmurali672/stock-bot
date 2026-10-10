@@ -14,7 +14,6 @@ SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
 CACHE = {}
 CACHE_TTL = 60
 MAX_WORKERS = 20
-DEFAULT_STOCKS = {"IRFC", "RVNL", "TCS", "WIPRO", "YESBANK"}
 
 def load_alerts():
     try:
@@ -29,10 +28,10 @@ def load_stocks():
         if os.path.exists(STOCKS_FILE):
             with open(STOCKS_FILE, "r") as f:
                 data = json.load(f)
-                if data and len(data) > 0:
+                if data:
                     return set([s.upper() for s in data])
     except: pass
-    return set(DEFAULT_STOCKS)
+    return set() # No defaults - empty stays empty
 
 ALERTS = load_alerts()
 TRACKED_STOCKS = load_stocks()
@@ -99,15 +98,12 @@ def get_multiple_data(symbols):
     return [(s, *results.get(s.upper(), (100.0, 0.0, 99.0, 101.0))) for s in symbols]
 
 def clean_invalid_on_startup():
-    global TRACKED_STOCKS
-    if len(TRACKED_STOCKS) == 0:
-        TRACKED_STOCKS = set(DEFAULT_STOCKS); save_stocks()
-        print("Restored defaults"); return
+    if len(TRACKED_STOCKS) == 0: return # empty stays empty - no restore
     to_remove = []
     for sym in list(TRACKED_STOCKS):
         if fetch_yahoo_raw(sym) is None:
             time.sleep(0.3)
-            if fetch_yahoo_raw(sym) is None: # double confirm
+            if fetch_yahoo_raw(sym) is None:
                 to_remove.append(sym)
     if len(to_remove) >= len(TRACKED_STOCKS) * 0.5 and len(TRACKED_STOCKS) > 2:
         print(f"SAFETY ABORT: {to_remove} would be deleted, skipping"); return
@@ -123,7 +119,11 @@ async def show_watchlist_menu(update: Update):
 
 async def show_positions(update: Update):
     if not TRACKED_STOCKS:
-        TRACKED_STOCKS.update(DEFAULT_STOCKS); save_stocks()
+        txt = "No stocks yet. Tap ➕ Add New Stock"
+        kb = [[InlineKeyboardButton("➕ Add New Stock", callback_data="add_stock")], [InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")]]
+        if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        else: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
     fetched = get_multiple_data(list(TRACKED_STOCKS))
     stock_data = [(sym, p, pct, low, high) for sym, p, pct, low, high in fetched]
     if SORT_MODE["mode"] == "low_high": stock_data.sort(key=lambda x: x[2]); chg_label = "%CHG ↑"
@@ -255,7 +255,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print(f"Bot Running - Professional Safe Build | {len(TRACKED_STOCKS)} tracked")
+    print(f"Bot Running - No Auto-Restore | {len(TRACKED_STOCKS)} tracked")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
