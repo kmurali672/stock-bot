@@ -20,7 +20,6 @@ ALERTS_FILE = "alerts.json"
 USER_STATE = {}
 SORT_MODE = {"mode": "default"}
 
-
 def load_alerts():
     try:
         if os.path.exists(ALERTS_FILE):
@@ -30,17 +29,13 @@ def load_alerts():
         pass
     return {}
 
-
 ALERTS = load_alerts()
-
 
 def save_alerts():
     with open(ALERTS_FILE, "w") as f:
         json.dump(ALERTS, f)
 
-
 MAIN_MENU = ReplyKeyboardMarkup([["📋 Watchlist"]], resize_keyboard=True)
-
 
 def get_full_data(symbol):
     try:
@@ -62,7 +57,6 @@ def get_full_data(symbol):
     except:
         return 100.0, 0.0, 99.0, 101.0
 
-
 async def show_watchlist_menu(update: Update):
     kb = [
         [
@@ -79,7 +73,6 @@ async def show_watchlist_menu(update: Update):
         await update.message.reply_text(
             txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
         )
-
 
 # SCREEN 1: 7 Columns Restored + Auto Adjust for YESBANK
 async def show_positions(update: Update):
@@ -140,7 +133,6 @@ async def show_positions(update: Update):
             txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
         )
 
-
 async def show_alert_options(update: Update, symbol):
     p, pct, low, high = get_full_data(symbol)
     txt = f"*{symbol}* - LTP Rs.{p:.1f} ({pct:+.1f}%)\nTDL Rs.{low:.1f} | TDH Rs.{high:.1f}"
@@ -166,7 +158,6 @@ async def show_alert_options(update: Update, symbol):
     await update.callback_query.edit_message_text(
         txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
     )
-
 
 # SCREEN 2: TDL TDH Added
 async def show_active_alerts(update: Update):
@@ -214,7 +205,6 @@ async def show_active_alerts(update: Update):
             full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
         )
 
-
 async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -233,7 +223,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "add_stock":
         USER_STATE[q.from_user.id] = {"action": "add_stock"}
         await q.edit_message_text(
-            "➕ *Add New Stock*\nSend symbol like: HDFC", parse_mode="Markdown"
+            "➕ *Add New Stock*\nSend symbol like: HDFC, TCS (comma suggested, ; also works)\nAny case: exideind, EXIDEIND", parse_mode="Markdown"
         )
         return
     if d == "sort_chg":
@@ -293,20 +283,25 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     text = update.message.text.strip()
     if uid in USER_STATE:
         state = USER_STATE[uid]
         if state["action"] == "add_stock":
-            sym = text.upper().replace(".NS", "")
-            if 1 <= len(sym) <= 15:
-                TRACKED_STOCKS.add(sym)
-                USER_STATE.pop(uid)
-                await update.message.reply_text(f"✅ {sym} added!")
-                await show_positions(update)
-                return
+            # FIX: any case +, and ; support, comma suggested
+            raw = text.replace(';', ',')
+            symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
+            added = []
+            for sym in symbols:
+                if 1 <= len(sym) <= 15:
+                    TRACKED_STOCKS.add(sym)
+                    added.append(sym)
+            USER_STATE.pop(uid)
+            if added:
+                await update.message.reply_text(f"✅ {', '.join(added)} added!")
+            await show_positions(update)
+            return
         elif text.replace(".", "", 1).isdigit():
             sym = state["symbol"]
             atype = state["action"]
@@ -324,25 +319,26 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Watchlist" in text:
         await show_watchlist_menu(update)
     else:
-        t = text.upper().strip()
-        if 1 <= len(t) <= 15:
-            TRACKED_STOCKS.add(t)
+        # FIX: direct add also supports exideind, EXIDEIND, comma and semicolon
+        raw = text.replace(';', ',')
+        symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
+        valid = [s for s in symbols if 1 <= len(s) <= 15]
+        if valid:
+            for s in valid:
+                TRACKED_STOCKS.add(s)
             await show_positions(update)
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot Ready! 📈")
+    await update.message.reply_text("Bot Ready! 📈", reply_markup=MAIN_MENU)
     await show_watchlist_menu(update)
-
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print("Bot Running - Fixed + All 3 screens")
+    print("Bot Running - OLD STYLE SAME + comma/semi anycase FIX")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
