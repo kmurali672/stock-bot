@@ -61,21 +61,45 @@ def is_valid_nse_symbol(symbol):
     try:
         sym = f"{symbol.upper()}.NS"
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        r = requests.get(
+        resp = requests.get(
             url,
             headers={"User-Agent": "Mozilla/5.0"},
             params={"range": "1d", "interval": "1m"},
             timeout=10,
-        ).json()
-        res = r.get("chart", {}).get("result")
-        if not res:
+        )
+        data = resp.json()
+        chart = data.get("chart", {})
+        if chart.get("error") is not None:
             return False
-        meta = res[0].get("meta", {})
-        if meta.get("regularMarketPrice") is None:
+        result = chart.get("result")
+        if not result:
+            return False
+        meta = result[0].get("meta", {})
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose")
+        if price is None or prev is None:
+            return False
+        if price == 0:
             return False
         return True
     except:
         return False
+
+def clean_invalid_on_startup():
+    to_remove = []
+    for sym in list(TRACKED_STOCKS):
+        if not is_valid_nse_symbol(sym):
+            to_remove.append(sym)
+        else:
+            p, pct, low, high = get_full_data(sym)
+            if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
+                to_remove.append(sym)
+    for sym in to_remove:
+        TRACKED_STOCKS.discard(sym)
+        ALERTS.pop(sym, None)
+    if to_remove:
+        save_alerts()
+        print(f"Cleaned invalid stocks: {to_remove}")
 
 async def show_watchlist_menu(update: Update):
     kb = [
@@ -314,8 +338,12 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for sym in symbols:
                 if 1 <= len(sym) <= 15:
                     if is_valid_nse_symbol(sym):
-                        TRACKED_STOCKS.add(sym)
-                        added.append(sym)
+                        p, pct, low, high = get_full_data(sym)
+                        if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
+                            invalid.append(sym)
+                        else:
+                            TRACKED_STOCKS.add(sym)
+                            added.append(sym)
                     else:
                         invalid.append(sym)
                 else:
@@ -351,8 +379,12 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sym in symbols:
             if 1 <= len(sym) <= 15:
                 if is_valid_nse_symbol(sym):
-                    TRACKED_STOCKS.add(sym)
-                    added.append(sym)
+                    p, pct, low, high = get_full_data(sym)
+                    if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
+                        invalid.append(sym)
+                    else:
+                        TRACKED_STOCKS.add(sym)
+                        added.append(sym)
                 else:
                     invalid.append(sym)
             else:
@@ -369,16 +401,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_watchlist_menu(update)
 
 def main():
-    # FIX: Remove any old webhook to prevent Conflict error
     try:
         requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=10)
     except:
         pass
+    clean_invalid_on_startup()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print("Bot Running - Fixed + validation + del fix + webhook fix")
+    print("Bot Running - Final Fixed + strict validation + cleanup + del + webhook")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
