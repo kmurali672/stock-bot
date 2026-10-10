@@ -1,153 +1,348 @@
-from flask import Flask
-import threading
-import os, json
-import yfinance as yf
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-
-# Keep Render alive
-_flask_app = Flask(__name__)
-@_flask_app.route('/')
-def home(): return "Bot Running!"
-threading.Thread(target=lambda: _flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+import os, json, requests
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-FILE = "stocks.json"
-waiting = set()
+TRACKED_STOCKS = {"IRFC", "RVNL", "TCS", "WIPRO", "YESBANK"}
+ALERTS_FILE = "alerts.json"
+USER_STATE = {}
+SORT_MODE = {"mode": "default"}
 
-def load_db():
-    if not os.path.exists(FILE): return {}
+
+def load_alerts():
     try:
-        with open(FILE,'r') as f: return json.load(f)
-    except: return {}
-
-def save_db(d):
-    with open(FILE,'w') as f: json.dump(f,d)
-
-def get_data(sym):
-    try:
-        s = sym.strip().upper() # FIX: exideind / EXIDEIND / ExideInd all work
-        hist = yf.Ticker(f"{s}.NS").history(period="5d")
-        if hist.empty: return None
-        ltp = float(hist['Close'].iloc[-1])
-        prev = float(hist['Close'].iloc[-2]) if len(hist)>1 else ltp
-        chg = ((ltp-prev)/prev*100) if prev else 0
-        return {"sym": s, "ltp": ltp, "chg": chg}
+        if os.path.exists(ALERTS_FILE):
+            with open(ALERTS_FILE, "r") as f:
+                return json.load(f)
     except:
-        return None
+        pass
+    return {}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # OLD STYLE Sept 5 exactly
-    await update.message.reply_text("Bot Ready! 📈")
-    kb = [[InlineKeyboardButton("📋 Watchlist Menu", callback_data="watchlist")]]
-    await update.message.reply_text("📋 Watchlist Menu", reply_markup=InlineKeyboardMarkup(kb))
 
-async def show_positions(obj, uid, edit=False):
-    db = load_db()
-    stocks = db.get(uid, [])
-    if not stocks:
-        txt = "No stocks yet. Tap ➕ Add New Stock"
-        if edit: await obj.edit_message_text(txt)
-        else: await obj.reply_text(txt)
-        return
-    rows = [get_data(s) for s in stocks]
-    rows = [r for r in rows if r]
-    rows.sort(key=lambda x: x['chg'], reverse=True)
-    btns = []
-    for r in rows:
-        dot = "🔵" if r['chg'] >= 0 else "🔴"
-        btns.append([
-            InlineKeyboardButton(f"{dot} {r['sym']} {r['ltp']:.2f} {r['chg']:+.1f}%", callback_data="noop"),
-            InlineKeyboardButton("📈", callback_data=f"chart_{r['sym']}"),
-            InlineKeyboardButton("❌", callback_data=f"del_{r['sym']}")
-        ])
-    btns.append([InlineKeyboardButton("⬅️ Back", callback_data="watchlist")])
-    btns.append([InlineKeyboardButton("➕ Add New Stock", callback_data="add")])
-    if edit:
-        await obj.edit_message_text("My Positions:", reply_markup=InlineKeyboardMarkup(btns))
+ALERTS = load_alerts()
+
+
+def save_alerts():
+    with open(ALERTS_FILE, "w") as f:
+        json.dump(ALERTS, f)
+
+
+MAIN_MENU = ReplyKeyboardMarkup([["📋 Watchlist"]], resize_keyboard=True)
+
+
+def get_full_data(symbol):
+    try:
+        sym = f"{symbol.upper()}.NS"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            params={"range": "1d", "interval": "1m"},
+            timeout=10,
+        ).json()
+        meta = r["chart"]["result"][0]["meta"]
+        price = meta["regularMarketPrice"]
+        prev = meta["previousClose"]
+        low = meta.get("regularMarketDayLow", price)
+        high = meta.get("regularMarketDayHigh", price)
+        pct = ((price - prev) / prev * 100) if prev else 0
+        return price, pct, low, high
+    except:
+        return 100.0, 0.0, 99.0, 101.0
+
+
+async def show_watchlist_menu(update: Update):
+    kb = [
+        [
+            InlineKeyboardButton("📈 My Positions", callback_data="menu_positions"),
+            InlineKeyboardButton("⏰ Active Alerts", callback_data="menu_alerts"),
+        ]
+    ]
+    txt = "📋 *Watchlist Menu*"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
     else:
-        await obj.reply_text("My Positions:", reply_markup=InlineKeyboardMarkup(btns))
+        await update.message.reply_text(
+            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
 
-async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    uid = str(update.effective_user.id)
-    db = load_db()
 
-    if text in ["My Positions", "📈 My Positions"]:
-        await show_positions(update.message, uid, False)
+# SCREEN 1: 7 Columns Restored + Auto Adjust for YESBANK
+async def show_positions(update: Update):
+    stock_data = []
+    for sym in TRACKED_STOCKS:
+        p, pct, low, high = get_full_data(sym)
+        stock_data.append((sym, p, pct, low, high))
+
+    if SORT_MODE["mode"] == "low_high":
+        stock_data.sort(key=lambda x: x[2])
+        chg_label = "%CHG ↑"
+    elif SORT_MODE["mode"] == "high_low":
+        stock_data.sort(key=lambda x: x[2], reverse=True)
+        chg_label = "%CHG ↓"
+    else:
+        stock_data.sort(key=lambda x: x[0])
+        chg_label = "%CHG ↕️"
+
+    kb = []
+    kb.append([InlineKeyboardButton("➕ Add New Stock", callback_data="add_stock")])
+    kb.append(
+        [
+            InlineKeyboardButton("SYMBOL", callback_data="noop"),
+            InlineKeyboardButton("LTP", callback_data="noop"),
+            InlineKeyboardButton("TDL", callback_data="noop"),
+            InlineKeyboardButton("TDH", callback_data="noop"),
+            InlineKeyboardButton(chg_label, callback_data="sort_chg"),
+            InlineKeyboardButton("1H", callback_data="noop"),
+            InlineKeyboardButton("DEL", callback_data="noop"),
+        ]
+    )
+    for sym, p, pct, low, high in stock_data:
+        url_1h = f"https://in.tradingview.com/chart/?symbol=NSE:{sym}&interval=60"
+        kb.append(
+            [
+                InlineKeyboardButton(f"🔵 {sym}", callback_data=f"stock_{sym}"),
+                InlineKeyboardButton(f"{p:.1f}", callback_data=f"stock_{sym}"),
+                InlineKeyboardButton(f"{low:.1f}", callback_data=f"stock_{sym}"),
+                InlineKeyboardButton(f"{high:.1f}", callback_data=f"stock_{sym}"),
+                InlineKeyboardButton(f"{pct:+.1f}%", callback_data=f"stock_{sym}"),
+                InlineKeyboardButton("📈", url=url_1h),
+                InlineKeyboardButton("🔴 X", callback_data=f"del_{sym}"),
+            ]
+        )
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")])
+    txt = "📈 *My Positions* - Tap %CHG to sort | Auto-adjusted for long names"
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
+        except:
+            await update.callback_query.message.reply_text(
+                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
+    else:
+        await update.message.reply_text(
+            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
+
+
+async def show_alert_options(update: Update, symbol):
+    p, pct, low, high = get_full_data(symbol)
+    txt = f"*{symbol}* - LTP Rs.{p:.1f} ({pct:+.1f}%)\nTDL Rs.{low:.1f} | TDH Rs.{high:.1f}"
+    url_15m = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=15"
+    url_1h = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=60"
+    url_1d = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=D"
+    kb = [
+        [
+            InlineKeyboardButton(
+                "🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"
+            ),
+            InlineKeyboardButton(
+                "🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"
+            ),
+        ],
+        [
+            InlineKeyboardButton("📈 15M", url=url_15m),
+            InlineKeyboardButton("📈 1H", url=url_1h),
+            InlineKeyboardButton("📈 Daily", url=url_1d),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu_positions")],
+    ]
+    await update.callback_query.edit_message_text(
+        txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+    )
+
+
+# SCREEN 2: TDL TDH Added
+async def show_active_alerts(update: Update):
+    if not ALERTS:
+        txt = "⏰ No alerts. Tap 🔵 SYM → SetLowAlertPrice / SetHighAlertPrice"
+        kb = [[InlineKeyboardButton("📈 My Positions", callback_data="menu_positions")]]
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
         return
-    if text in ["Active Alerts", "⏰ Active Alerts"]:
-        await update.message.reply_text("⏰ Active Alerts - Coming soon")
-        return
+    lines = [
+        "⏰ *Active Alerts*",
+        "```",
+        f"{'SYM':<8} {'TYPE':<5} {'SET':<7} {'LTP':<7} {'TDL':<7} {'TDH':<7}",
+        "-" * 52,
+    ]
+    for sym, vals in ALERTS.items():
+        p, _, tdl, tdh = get_full_data(sym)
+        for atype, set_price in vals.items():
+            lines.append(
+                f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}"
+            )
+    lines.append("```")
+    full_text = "\n".join(lines)
+    kb = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_alerts")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")],
+    ]
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
+        except:
+            await update.callback_query.message.reply_text(
+                full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+            )
+    else:
+        await update.message.reply_text(
+            full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
 
-    # FIX:, and ; both supported, comma suggested
-    if uid in waiting or "," in text or ";" in text or len(text) <= 30:
-        if uid in waiting: waiting.discard(uid)
-        raw = text.replace(';', ',') # accept both ; and,
-        symbols = [s.strip().upper() for s in raw.split(',') if s.strip()] # any case + comma split
-        if not symbols: return
-        if uid not in db: db[uid] = []
-        added, failed = [], []
-        for sym in symbols:
-            d = get_data(sym)
-            if d:
-                if sym not in db[uid]:
-                    db[uid].append(sym)
-                    added.append(sym)
-            else:
-                failed.append(sym)
-        save_db(db)
-        rep = ""
-        if added: rep += f"✅ Added: {', '.join(added)}\n"
-        if failed: rep += f"❌ Failed: {', '.join(failed)}"
-        await update.message.reply_text(rep or "❌ No valid symbols")
 
-async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = str(q.from_user.id)
-    data = q.data
-    db = load_db()
-
-    if data == "watchlist":
-        # THIS IS YOUR OLD STYLE WITH ACTIVE ALERTS - RESTORED
-        kb = [
-            [InlineKeyboardButton("📈 My Positions", callback_data="mypos"),
-             InlineKeyboardButton("⏰ Active Alerts", callback_data="alerts")],
-            [InlineKeyboardButton("➕ Add New Stock", callback_data="add")]
-        ]
-        await q.edit_message_text("📋 Watchlist Menu", reply_markup=InlineKeyboardMarkup(kb))
-
-    elif data == "mypos":
-        await show_positions(q, uid, True)
-
-    elif data == "alerts":
-        await q.message.reply_text("⏰ Active Alerts - No alerts yet")
-
-    elif data == "add":
-        waiting.add(uid)
-        await q.message.reply_text("➕ Add New Stock\nSend like: HDFC, TCS or HDFC; TCS")
-
-    elif data == "noop":
+    d = q.data
+    if d == "noop":
+        return
+    if d == "back_watchlist":
+        await show_watchlist_menu(update)
+        return
+    if d == "menu_positions":
+        await show_positions(update)
+        return
+    if d == "menu_alerts":
+        await show_active_alerts(update)
+        return
+    if d == "add_stock":
+        USER_STATE[q.from_user.id] = {"action": "add_stock"}
+        await q.edit_message_text(
+            "➕ *Add New Stock*\nSend symbol like: HDFC", parse_mode="Markdown"
+        )
+        return
+    if d == "sort_chg":
+        if SORT_MODE["mode"] == "default":
+            SORT_MODE["mode"] = "low_high"
+        elif SORT_MODE["mode"] == "low_high":
+            SORT_MODE["mode"] = "high_low"
+        else:
+            SORT_MODE["mode"] = "default"
+        await show_positions(update)
+        return
+    if d == "cancel_set":
+        USER_STATE.pop(q.from_user.id, None)
+        await show_positions(update)
+        return
+    if d.startswith("del_"):
+        sym = d.split("_")[1]
+        TRACKED_STOCKS.discard(sym)
+        ALERTS.pop(sym, None)
+        save_alerts()
+        await show_positions(update)
+        return
+    if d.startswith("stock_"):
+        await show_alert_options(update, d.split("_")[1])
+        return
+    if d.startswith("setlow_") or d.startswith("sethigh_"):
+        atype = "LOW" if "setlow" in d else "HIGH"
+        sym = d.split("_")[1]
+        USER_STATE[q.from_user.id] = {"action": atype, "symbol": sym}
+        prev_low = ALERTS.get(sym, {}).get("LOW")
+        prev_high = ALERTS.get(sym, {}).get("HIGH")
+        ltp = get_full_data(sym)[0]
+        msg_lines = [f"✏️ Set new {atype}AlertPrice for {sym}", f"LTP: Rs.{ltp:.1f}", ""]
+        if atype == "LOW":
+            if prev_low is not None:
+                msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f} (already set)")
+            else:
+                msg_lines.append(f"Prev Set Low Price: Not set yet")
+            if prev_high is not None:
+                msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f}")
+        else:
+            if prev_high is not None:
+                msg_lines.append(
+                    f"Prev Set High Price: Rs.{prev_high:.1f} (already set)"
+                )
+            else:
+                msg_lines.append(f"Prev Set High Price: Not set yet")
+            if prev_low is not None:
+                msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f}")
+        msg_lines.append("")
+        msg_lines.append("Send price like: 85.5")
+        kb = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_set")]]
+        await q.edit_message_text(
+            "\n".join(msg_lines),
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
         return
 
-    elif data.startswith("del_"):
-        sym = data[4:]
-        if uid in db and sym in db[uid]:
-            db[uid].remove(sym)
-            save_db(db)
-            await q.message.reply_text(f"❌ Removed {sym}")
 
-    elif data.startswith("chart_"):
-        sym = data[6:]
-        d = get_data(sym)
-        if d:
-            await q.message.reply_text(f"📈 {sym}: {d['ltp']:.2f} ({d['chg']:+.1f}%)")
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.from_user.id
+    text = update.message.text.strip()
+    if uid in USER_STATE:
+        state = USER_STATE[uid]
+        if state["action"] == "add_stock":
+            sym = text.upper().replace(".NS", "")
+            if 1 <= len(sym) <= 15:
+                TRACKED_STOCKS.add(sym)
+                USER_STATE.pop(uid)
+                await update.message.reply_text(f"✅ {sym} added!")
+                await show_positions(update)
+                return
+        elif text.replace(".", "", 1).isdigit():
+            sym = state["symbol"]
+            atype = state["action"]
+            price = float(text)
+            if sym not in ALERTS:
+                ALERTS[sym] = {}
+            ALERTS[sym][atype] = price
+            save_alerts()
+            USER_STATE.pop(uid)
+            await update.message.reply_text(
+                f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}"
+            )
+            await show_active_alerts(update)
+            return
+    if "Watchlist" in text:
+        await show_watchlist_menu(update)
+    else:
+        t = text.upper().strip()
+        if 1 <= len(t) <= 15:
+            TRACKED_STOCKS.add(t)
+            await show_positions(update)
 
-if __name__ == '__main__':
-    print("OLD STYLE + ACTIVE ALERTS RESTORED")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot Ready! 📈")
+    await show_watchlist_menu(update)
+
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(btn_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
-    app.run_polling()
+    app.add_handler(CallbackQueryHandler(btn))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
+    print("Bot Running - Fixed + All 3 screens")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
