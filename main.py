@@ -1,162 +1,128 @@
 from flask import Flask
 import threading
-import os, json, requests
+import os, json
 import yfinance as yf
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# --- Keep Render Alive (Free Web Service Fix) ---
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot is Running! 🤖"
+# --- Render FREE fix - keeps LIVE green (doesn't affect UI) ---
+_flask_app = Flask(__name__)
+@_flask_app.route('/')
+def home(): return "Bot Running!"
+def _run_web():
+    _flask_app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+threading.Thread(target=_run_web, daemon=True).start()
 
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
-
-# --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-STOCK_FILE = "stocks.json"
-waiting_for_stock = set()
+FILE = "stocks.json"
+waiting = set()
 
-# --- Storage ---
-def load_stocks():
-    if not os.path.exists(STOCK_FILE):
-        return {}
+def load_db():
+    if not os.path.exists(FILE): return {}
     try:
-        with open(STOCK_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+        with open(FILE,'r') as f: return json.load(f)
+    except: return {}
 
-def save_stocks(data):
-    with open(STOCK_FILE, 'w') as f:
-        json.dump(data, f)
+def save_db(d):
+    with open(FILE,'w') as f: json.dump(f,d)
 
-def get_stock_data(symbol):
+def get_data(sym):
     try:
-        sym = symbol.strip().upper()
-        if not sym.endswith(".NS"):
-            ticker_sym = f"{sym}.NS"
-        else:
-            ticker_sym = sym
-        
-        ticker = yf.Ticker(ticker_sym)
+        s = sym.strip().upper()
+        ticker = yf.Ticker(f"{s}.NS" if not s.endswith(".NS") else s)
         hist = ticker.history(period="2d")
-        if hist.empty:
-            return None, f"{sym} not found"
+        if hist.empty: return None
         ltp = float(hist['Close'].iloc[-1])
-        prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else ltp
-        change = ((ltp - prev) / prev * 100) if prev != 0 else 0
-        return {"symbol": sym, "ltp": ltp, "change": change}, None
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return None, str(e)
+        prev = float(hist['Close'].iloc[-2]) if len(hist)>1 else ltp
+        chg = ((ltp-prev)/prev*100) if prev else 0
+        return {"sym":s,"ltp":ltp,"chg":chg}
+    except: return None
 
-# --- Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["My Positions"], ["➕ Add New Stock"]]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(
-        "Bot Ready! 📈\n\nClick My Positions to view or Add New Stock to add.",
-        reply_markup=markup
-    )
+    kb = [["My Positions"],["➕ Add New Stock"]]
+    await update.message.reply_text("Bot Ready! 📈", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    user_id = str(update.effective_user.id)
-    stocks_db = load_stocks()
+    uid = str(update.effective_user.id)
+    db = load_db()
 
     if text == "My Positions":
-        user_stocks = stocks_db.get(user_id, [])
-        if not user_stocks:
-            await update.message.reply_text("No stocks added yet. Click ➕ Add New Stock")
+        stocks = db.get(uid, [])
+        if not stocks:
+            await update.message.reply_text("No stocks. Click ➕ Add New Stock")
             return
-        
-        # Fetch all data
-        results = []
-        for sym in user_stocks:
-            data, err = get_stock_data(sym)
-            if data:
-                results.append(data)
-        
-        # Sort by % change
-        results.sort(key=lambda x: x['change'], reverse=True)
-        
-        msg = "My Positions - Tap %CHG to sort:\n\n"
-        msg += f"{'Symbol':<10} {'LTP':<8} {'%CHG'}\n"
-        msg += "-"*30 + "\n"
-        for r in results:
-            msg += f"{r['symbol']:<10} {r['ltp']:.2f} {r['change']:+.2f}%\n"
-        
-        # Inline button for sorting (just visual)
-        keyboard = [[InlineKeyboardButton("➕ Add New Stock", callback_data="add")]]
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        rows=[]
+        for sym in stocks:
+            d=get_data(sym)
+            if d: rows.append(d)
+        rows.sort(key=lambda x:x['chg'], reverse=True)
+        msg = "My Positions:\n\n"
+        for r in rows:
+            dot = "🔵" if r['chg']>=0 else "🔴"
+            msg += f"{dot} {r['sym']} {r['ltp']:.2f} {r['chg']:+.2f}%\n"
+        btns = [[InlineKeyboardButton(f"📈 {r['sym']}", callback_data=f"chart_{r['sym']}"), InlineKeyboardButton("❌", callback_data=f"del_{r['sym']}")] for r in rows]
+        btns.append([InlineKeyboardButton("➕ Add New Stock", callback_data="add")])
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(btns))
+        return
 
-    elif text == "➕ Add New Stock" or text == "+ Add New Stock":
-        waiting_for_stock.add(user_id)
-        await update.message.reply_text("➕ Add New Stock\nSend symbol like: RELIANCE or RELIANCE, TCS, INFY")
+    if text == "➕ Add New Stock":
+        waiting.add(uid)
+        await update.message.reply_text("➕ Add New Stock\nSend symbols like: HDFC, TCS\n(Any case works: exideind, EXIDEIND, ExideInd)")
+        return
 
-    else:
-        # User is sending symbols to add
-        if user_id in waiting_for_stock or "," in text or text.isupper():
-            if user_id in waiting_for_stock:
-                waiting_for_stock.discard(user_id)
-            
-            symbols = [s.strip().upper() for s in text.split(',') if s.strip()]
-            added = []
-            failed = []
-            
-            if user_id not in stocks_db:
-                stocks_db[user_id] = []
-            
-            for sym in symbols:
-                print(f"USER TYPED: {sym} - Trying to add")
-                data, err = get_stock_data(sym)
-                if data:
-                    if sym not in stocks_db[user_id]:
-                        stocks_db[user_id].append(sym)
-                        added.append(f"{sym} ({data['ltp']:.2f})")
-                    else:
-                        added.append(f"{sym} already exists")
+    # --- FIX: case-insensitive +, and ; support - comma is suggested ---
+    if uid in waiting or "," in text or ";" in text or (text.replace(" ","").replace(",","").replace(";","").isalnum() and len(text)<=50):
+        if uid in waiting: waiting.discard(uid)
+        raw = text.replace(';', ',') # accept both ; and,
+        symbols = [s.strip().upper() for s in raw.split(',') if s.strip()]
+        print(f"USER TYPED: {text} -> PARSED: {symbols}")
+
+        if uid not in db: db[uid]=[]
+        added, failed = [], []
+        for sym in symbols:
+            if not sym: continue
+            d=get_data(sym)
+            if d:
+                if sym not in db[uid]:
+                    db[uid].append(sym)
+                    added.append(sym)
                 else:
-                    failed.append(f"{sym} - {err}")
-            
-            save_stocks(stocks_db)
-            
-            reply = ""
-            if added:
-                reply += "✅ Added: " + ", ".join(added) + "\n"
-            if failed:
-                reply += "❌ Failed: " + ", ".join(failed) + "\n"
-            
-            if not reply:
-                reply = "Send valid symbols like: EXIDEIND, SUZLON"
-            
-            await update.message.reply_text(reply)
-            # Show positions again
-            await handle_message(update, context) if False else None
-        else:
-            await update.message.reply_text("Click ➕ Add New Stock to add symbols")
+                    added.append(f"{sym} (already)")
+            else:
+                failed.append(sym)
+        save_db(db)
+        reply=""
+        if added: reply+=f"✅ Added: {', '.join(added)}\n"
+        if failed: reply+=f"❌ Failed: {', '.join(failed)}"
+        if not reply: reply="❌ No valid symbols"
+        await update.message.reply_text(reply)
+        return
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "add":
-        waiting_for_stock.add(str(query.from_user.id))
-        await query.message.reply_text("➕ Add New Stock\nSend symbol like: RELIANCE or RELIANCE, TCS")
+async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    await q.answer()
+    uid=str(q.from_user.id)
+    data=q.data
+    db=load_db()
+    if data=="add":
+        waiting.add(uid)
+        await q.message.reply_text("➕ Add New Stock\nSend symbols like: HDFC, TCS")
+    elif data.startswith("del_"):
+        sym=data[4:]
+        if uid in db and sym in db[uid]:
+            db[uid].remove(sym)
+            save_db(db)
+            await q.message.reply_text(f"❌ Removed {sym}")
+    elif data.startswith("chart_"):
+        sym=data[6:]
+        d=get_data(sym)
+        if d: await q.message.reply_text(f"📈 {sym}: {d['ltp']:.2f} ({d['chg']:+.2f}%)")
 
-# --- Main ---
-if __name__ == '__main__':
-    print("Bot Running - Fixed + All 3 screens + Flask")
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN not set in Environment Variables!")
-    else:
-        app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-        app_bot.add_handler(CommandHandler("start", start))
-        app_bot.add_handler(CallbackQueryHandler(button_handler))
-        app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app_bot.run_polling()
+if __name__=='__main__':
+    print("Bot Running - Old Style Same - Comma Suggested + ; Supported + AnyCase")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(btn_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.run_polling()
