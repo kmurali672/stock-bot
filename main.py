@@ -1,54 +1,26 @@
-import os, json, requests, time, threading
+import os, json, requests, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "")
+
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 ALERTS_FILE = os.path.join(DATA_DIR, "alerts.json")
 STOCKS_FILE = os.path.join(DATA_DIR, "stocks.json")
+
 USER_STATE = {}
 SORT_MODE = {"mode": "default"}
 CACHE = {}
 CACHE_TTL = 60
 MAX_WORKERS = 10
-IGNORE_WORDS = {"perfect","ok","okay","thanks","thank you","hi","hello","good","great","done","nice","yes","no"}
-
-def backup_to_telegram():
-    if not BACKUP_CHANNEL_ID or not BOT_TOKEN: return
-    try:
-        data = {"stocks": list(TRACKED_STOCKS), "alerts": ALERTS}
-        text = f"BACKUP_JSON:{json.dumps(data)}"
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": BACKUP_CHANNEL_ID, "text": text}, timeout=8)
-        if r.ok:
-            msg_id = r.json()["result"]["message_id"]
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage", json={"chat_id": BACKUP_CHANNEL_ID, "message_id": msg_id}, timeout=8)
-    except: pass
-
-def backup_in_background():
-    threading.Thread(target=backup_to_telegram, daemon=True).start()
-
-def restore_from_telegram():
-    if not BACKUP_CHANNEL_ID or not BOT_TOKEN: return None
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getChat", params={"chat_id": BACKUP_CHANNEL_ID}, timeout=8)
-        if r.ok:
-            pinned = r.json()["result"].get("pinned_message")
-            if pinned and "text" in pinned and "BACKUP_JSON:" in pinned["text"]:
-                j = pinned["text"].split("BACKUP_JSON:",1)[1]
-                return json.loads(j)
-    except: pass
-    return None
 
 def load_alerts():
     try:
         if os.path.exists(ALERTS_FILE):
             with open(ALERTS_FILE, "r") as f: return json.load(f)
     except: pass
-    bk = restore_from_telegram()
-    if bk and "alerts" in bk: return bk["alerts"]
     return {}
 
 def load_stocks():
@@ -58,28 +30,17 @@ def load_stocks():
                 data = json.load(f)
                 if data: return set([s.upper() for s in data])
     except: pass
-    bk = restore_from_telegram()
-    if bk and "stocks" in bk and bk["stocks"]:
-        return set([s.upper() for s in bk["stocks"]])
     return set()
 
-def save_stocks_quick():
+def save_stocks():
     try:
         with open(STOCKS_FILE, "w") as f: json.dump(list(TRACKED_STOCKS), f)
     except: pass
 
-def save_alerts_quick():
+def save_alerts():
     try:
         with open(ALERTS_FILE, "w") as f: json.dump(ALERTS, f)
     except: pass
-
-def save_stocks():
-    save_stocks_quick()
-    backup_in_background()
-
-def save_alerts():
-    save_alerts_quick()
-    backup_in_background()
 
 ALERTS = load_alerts()
 TRACKED_STOCKS = load_stocks()
@@ -89,14 +50,14 @@ def fetch_yahoo_raw(symbol):
     try:
         sym = f"{symbol.upper()}.NS"
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        r = requests.get(url, params={"range": "1d", "interval": "1m"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        r = requests.get(url, params={"range": "1d", "interval": "1m"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         data = r.json(); chart = data.get("chart", {})
         if chart.get("error") is not None: return None
         result = chart.get("result")
         if not result: return None
         meta = result[0].get("meta", {})
         price = meta.get("regularMarketPrice"); prev = meta.get("previousClose")
-        if price is None or prev is None or price == 0: return None
+        if price is None or prev is None: return None
         low = meta.get("regularMarketDayLow", price); high = meta.get("regularMarketDayHigh", price)
         pct = ((price - prev) / prev * 100) if prev else 0
         return price, pct, low, high
@@ -106,7 +67,7 @@ def get_full_data(symbol):
     su = symbol.upper(); now = time.time()
     if su in CACHE and now - CACHE[su][0] < CACHE_TTL: return CACHE[su][1]
     vals = fetch_yahoo_raw(su)
-    if vals is None: return 100.0, 0.0, 99.0, 101.0
+    if vals is None: return (0,0,0,0)
     CACHE[su] = (now, vals); return vals
 
 def get_multiple_data(symbols):
@@ -116,21 +77,15 @@ def get_multiple_data(symbols):
         for fut in as_completed(fut_map):
             sym = fut_map[fut]
             try:
-                v = fut.result(timeout=5)
+                v = fut.result(timeout=6)
                 if v: CACHE[sym.upper()] = (time.time(), v); results[sym.upper()] = v
             except: pass
     out = []
     for s in symbols:
         su = s.upper()
-        if su in results:
-            p,pct,low,high = results[su]
-            out.append((s,p,pct,low,high))
-        else:
-            if su in CACHE:
-                p,pct,low,high = CACHE[su][1]
-                out.append((s,p,pct,low,high))
-            else:
-                out.append((s,0.0,0.0,0.0,0.0))
+        if su in results: p,pct,low,high = results[su]; out.append((s,p,pct,low,high))
+        elif su in CACHE: p,pct,low,high = CACHE[su][1]; out.append((s,p,pct,low,high))
+        else: out.append((s,0,0,0,0))
     return out
 
 async def show_watchlist_menu(update: Update):
@@ -159,7 +114,7 @@ async def show_positions(update: Update):
     txt = f"📈 *My Positions* ({len(stock_data)} stocks)"
     if update.callback_query:
         try: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except: await update.callback_query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except: pass
     else: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def show_alert_options(update: Update, symbol):
@@ -182,9 +137,7 @@ async def show_active_alerts(update: Update):
         for atype, set_price in vals.items(): lines.append(f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f}")
     lines.append("```"); full_text = "\n".join(lines)
     kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_alerts")], [InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")]]
-    if update.callback_query:
-        try: await update.callback_query.edit_message_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except: await update.callback_query.message.reply_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    if update.callback_query: await update.callback_query.edit_message_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else: await update.message.reply_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,14 +157,9 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "cancel_set": USER_STATE.pop(q.from_user.id, None); await show_positions(update); return
     if d.startswith("del_"):
         sym = d[4:]
-        TRACKED_STOCKS.discard(sym)
-        ALERTS.pop(sym, None)
-        save_stocks_quick()
-        save_alerts_quick()
-        CACHE.pop(sym, None)
-        backup_in_background()
-        await show_positions(update)
-        return
+        TRACKED_STOCKS.discard(sym); ALERTS.pop(sym, None)
+        save_stocks(); save_alerts(); CACHE.pop(sym, None)
+        await show_positions(update); return
     if d.startswith("stock_"): await show_alert_options(update, d.split("_")[1]); return
     if d.startswith("setlow_") or d.startswith("sethigh_"):
         atype = "LOW" if "setlow" in d else "HIGH"; sym = d.split("_")[1]
@@ -228,7 +176,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.message.from_user.id; raw_text = update.message.text.strip(); up_text = raw_text.upper()
         if not raw_text: return
-        if raw_text.lower() in IGNORE_WORDS: return
+        if raw_text.lower() in ["perfect","ok","thanks","thank you","hi","hello"]: return
         if up_text in ["/START", "START"]: USER_STATE.pop(uid, None); await start(update, context); return
         if "WATCHLIST" in up_text: USER_STATE.pop(uid, None); await show_watchlist_menu(update); return
         if uid in USER_STATE:
@@ -238,10 +186,8 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 added = [s for s in symbols if 1 <= len(s) <= 15]
                 for s in added: TRACKED_STOCKS.add(s)
                 if added: save_stocks()
-                USER_STATE.pop(uid, None)
-                await show_positions(update)
-                if added: await update.message.reply_text(f"✅ {', '.join(added)} added!")
-                return
+                USER_STATE.pop(uid, None); await show_positions(update)
+                if added: await update.message.reply_text(f"✅ {', '.join(added)} added!"); return
             elif raw_text.replace(".", "", 1).isdigit():
                 sym = state["symbol"]; atype = state["action"]; price = float(raw_text)
                 if sym not in ALERTS: ALERTS[sym] = {}
@@ -250,16 +196,12 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw = raw_text.replace(';', ','); symbols = [s.strip().upper().replace(".NS","") for s in raw.split(',') if s.strip()]
         if not symbols: return
         if len(symbols) == 1 and len(symbols[0]) > 15: return
-        added = [s for s in symbols if 1 <= len(s) <= 15 and s.lower() not in IGNORE_WORDS]
-        if not added: return
+        if symbols[0].lower() in ["perfect","ok","thanks"]: return
+        added = [s for s in symbols if 1 <= len(s) <= 15]
         for s in added: TRACKED_STOCKS.add(s)
-        save_stocks()
-        await show_positions(update)
-        await update.message.reply_text(f"✅ {', '.join(added)} added!")
+        if added: save_stocks(); await show_positions(update); await update.message.reply_text(f"✅ {', '.join(added)} added!")
     except Exception as e:
         print(f"menu error {e}")
-        try: USER_STATE.pop(update.message.from_user.id, None); await update.message.reply_text("Recovered. Send /start")
-        except: pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_STATE.pop(update.message.from_user.id, None)
@@ -273,7 +215,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    print(f"Bot No Backup - Fast | {len(TRACKED_STOCKS)} stocks")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
