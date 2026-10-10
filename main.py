@@ -1,4 +1,5 @@
-import os, json, requests
+import os, json, requests, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -15,10 +16,17 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-TRACKED_STOCKS = {"IRFC", "RVNL", "TCS", "WIPRO", "YESBANK"}
 ALERTS_FILE = "alerts.json"
+STOCKS_FILE = "stocks.json"
 USER_STATE = {}
 SORT_MODE = {"mode": "default"}
+
+# --- OPTIMIZATION ---
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+CACHE = {} # sym -> (timestamp, price, pct, low, high)
+CACHE_TTL = 60 # seconds
+MAX_WORKERS = 20 # for 100+ stocks
 
 def load_alerts():
     try:
@@ -29,76 +37,118 @@ def load_alerts():
         pass
     return {}
 
+def load_stocks():
+    try:
+        if os.path.exists(STOCKS_FILE):
+            with open(STOCKS_FILE, "r") as f:
+                data = json.load(f)
+                return set(data)
+    except:
+        pass
+    return {"IRFC", "RVNL", "TCS", "WIPRO", "YESBANK"}
+
 ALERTS = load_alerts()
+TRACKED_STOCKS = load_stocks()
 
 def save_alerts():
     with open(ALERTS_FILE, "w") as f:
         json.dump(ALERTS, f)
 
+def save_stocks():
+    with open(STOCKS_FILE, "w") as f:
+        json.dump(list(TRACKED_STOCKS), f)
+
 MAIN_MENU = ReplyKeyboardMarkup([["📋 Watchlist"]], resize_keyboard=True)
 
-def get_full_data(symbol):
+def fetch_yahoo_raw(symbol):
     try:
         sym = f"{symbol.upper()}.NS"
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            params={"range": "1d", "interval": "1m"},
-            timeout=10,
-        ).json()
-        meta = r["chart"]["result"][0]["meta"]
-        price = meta["regularMarketPrice"]
-        prev = meta["previousClose"]
+        r = SESSION.get(url, params={"range": "1d", "interval": "1m"}, timeout=10)
+        data = r.json()
+        chart = data.get("chart", {})
+        if chart.get("error") is not None:
+            return None
+        result = chart.get("result")
+        if not result:
+            return None
+        meta = result[0].get("meta", {})
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose")
+        if price is None or prev is None or price == 0:
+            return None
         low = meta.get("regularMarketDayLow", price)
         high = meta.get("regularMarketDayHigh", price)
         pct = ((price - prev) / prev * 100) if prev else 0
         return price, pct, low, high
     except:
-        return 100.0, 0.0, 99.0, 101.0
+        return None
+
+def get_full_data(symbol):
+    sym = symbol.upper()
+    now = time.time()
+    if sym in CACHE:
+        ts, vals = CACHE[sym]
+        if now - ts < CACHE_TTL:
+            return vals
+    vals = fetch_yahoo_raw(sym)
+    if vals is None:
+        return 100.0, 0.0, 99.0, 101.0 # dummy for invalid
+    CACHE[sym] = (now, vals)
+    return vals
 
 def is_valid_nse_symbol(symbol):
-    try:
-        sym = f"{symbol.upper()}.NS"
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            params={"range": "1d", "interval": "1m"},
-            timeout=10,
-        )
-        data = resp.json()
-        chart = data.get("chart", {})
-        if chart.get("error") is not None:
-            return False
-        result = chart.get("result")
-        if not result:
-            return False
-        meta = result[0].get("meta", {})
-        price = meta.get("regularMarketPrice")
-        prev = meta.get("previousClose")
-        if price is None or prev is None:
-            return False
-        if price == 0:
-            return False
-        return True
-    except:
+    # uses same fetch, but no dummy caching
+    vals = fetch_yahoo_raw(symbol)
+    if vals is None:
         return False
+    # cache it immediately for next use
+    CACHE[symbol.upper()] = (time.time(), vals)
+    return True
+
+def get_multiple_data(symbols):
+    # parallel fetch for 100+ stocks
+    results = {}
+    symbols = list(symbols)
+    # first take from cache
+    to_fetch = []
+    now = time.time()
+    for s in symbols:
+        su = s.upper()
+        if su in CACHE and now - CACHE[su][0] < CACHE_TTL:
+            results[su] = CACHE[su][1]
+        else:
+            to_fetch.append(su)
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            future_map = {ex.submit(fetch_yahoo_raw, s): s for s in to_fetch}
+            for fut in as_completed(future_map):
+                sym = future_map[fut]
+                try:
+                    vals = fut.result()
+                    if vals:
+                        CACHE[sym] = (time.time(), vals)
+                        results[sym] = vals
+                    else:
+                        results[sym] = (100.0, 0.0, 99.0, 101.0)
+                except:
+                    results[sym] = (100.0, 0.0, 99.0, 101.0)
+    # return in original order
+    return [(s, *results.get(s.upper(), (100.0, 0.0, 99.0, 101.0))) for s in symbols]
 
 def clean_invalid_on_startup():
     to_remove = []
-    for sym in list(TRACKED_STOCKS):
-        if not is_valid_nse_symbol(sym):
+    # check in parallel
+    fetched = get_multiple_data(list(TRACKED_STOCKS))
+    for sym, p, pct, low, high in fetched:
+        if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
             to_remove.append(sym)
-        else:
-            p, pct, low, high = get_full_data(sym)
-            if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
-                to_remove.append(sym)
     for sym in to_remove:
         TRACKED_STOCKS.discard(sym)
         ALERTS.pop(sym, None)
     if to_remove:
         save_alerts()
+        save_stocks()
         print(f"Cleaned invalid stocks: {to_remove}")
 
 async def show_watchlist_menu(update: Update):
@@ -119,10 +169,8 @@ async def show_watchlist_menu(update: Update):
         )
 
 async def show_positions(update: Update):
-    stock_data = []
-    for sym in TRACKED_STOCKS:
-        p, pct, low, high = get_full_data(sym)
-        stock_data.append((sym, p, pct, low, high))
+    fetched = get_multiple_data(list(TRACKED_STOCKS))
+    stock_data = [(sym, p, pct, low, high) for sym, p, pct, low, high in fetched]
 
     if SORT_MODE["mode"] == "low_high":
         stock_data.sort(key=lambda x: x[2])
@@ -161,7 +209,7 @@ async def show_positions(update: Update):
             ]
         )
     kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")])
-    txt = "📈 *My Positions* - Tap %CHG to sort | Auto-adjusted for long names"
+    txt = f"📈 *My Positions* ({len(stock_data)} stocks) - Tap %CHG to sort"
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(
@@ -184,12 +232,8 @@ async def show_alert_options(update: Update, symbol):
     url_1d = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=D"
     kb = [
         [
-            InlineKeyboardButton(
-                "🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"
-            ),
-            InlineKeyboardButton(
-                "🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"
-            ),
+            InlineKeyboardButton("🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"),
+            InlineKeyboardButton("🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"),
         ],
         [
             InlineKeyboardButton("📈 15M", url=url_15m),
@@ -207,14 +251,11 @@ async def show_active_alerts(update: Update):
         txt = "⏰ No alerts. Tap 🔵 SYM → SetLowAlertPrice / SetHighAlertPrice"
         kb = [[InlineKeyboardButton("📈 My Positions", callback_data="menu_positions")]]
         if update.callback_query:
-            await update.callback_query.edit_message_text(
-                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         else:
-            await update.message.reply_text(
-                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
+    fetched_map = {sym: (p, tdl, tdh) for sym, p, _, tdl, tdh in get_multiple_data(list(ALERTS.keys()))}
     lines = [
         "⏰ *Active Alerts*",
         "```",
@@ -222,11 +263,9 @@ async def show_active_alerts(update: Update):
         "-" * 52,
     ]
     for sym, vals in ALERTS.items():
-        p, _, tdl, tdh = get_full_data(sym)
+        p, tdl, tdh = fetched_map.get(sym, (100.0, 99.0, 101.0))
         for atype, set_price in vals.items():
-            lines.append(
-                f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}"
-            )
+            lines.append(f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}")
     lines.append("```")
     full_text = "\n".join(lines)
     kb = [
@@ -235,17 +274,11 @@ async def show_active_alerts(update: Update):
     ]
     if update.callback_query:
         try:
-            await update.callback_query.edit_message_text(
-                full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.callback_query.edit_message_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         except:
-            await update.callback_query.message.reply_text(
-                full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.callback_query.message.reply_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-        )
+        await update.message.reply_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -264,9 +297,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if d == "add_stock":
         USER_STATE[q.from_user.id] = {"action": "add_stock"}
-        await q.edit_message_text(
-            "➕ *Add New Stock*\nSend like: HDFC, TCS (comma suggested, ; also works)\nAny case: exideind, EXIDEIND", parse_mode="Markdown"
-        )
+        await q.edit_message_text("➕ *Add New Stock*\nSend like: HDFC, TCS (comma suggested, ; also works)\nAny case: exideind, EXIDEIND", parse_mode="Markdown")
         return
     if d == "sort_chg":
         if SORT_MODE["mode"] == "default":
@@ -286,6 +317,8 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TRACKED_STOCKS.discard(sym)
         ALERTS.pop(sym, None)
         save_alerts()
+        save_stocks()
+        CACHE.pop(sym, None)
         await show_positions(update)
         return
     if d.startswith("stock_"):
@@ -308,9 +341,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f}")
         else:
             if prev_high is not None:
-                msg_lines.append(
-                    f"Prev Set High Price: Rs.{prev_high:.1f} (already set)"
-                )
+                msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f} (already set)")
             else:
                 msg_lines.append(f"Prev Set High Price: Not set yet")
             if prev_low is not None:
@@ -318,11 +349,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_lines.append("")
         msg_lines.append("Send price like: 85.5")
         kb = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_set")]]
-        await q.edit_message_text(
-            "\n".join(msg_lines),
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
+        await q.edit_message_text("\n".join(msg_lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,16 +365,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for sym in symbols:
                 if 1 <= len(sym) <= 15:
                     if is_valid_nse_symbol(sym):
-                        p, pct, low, high = get_full_data(sym)
-                        if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
-                            invalid.append(sym)
-                        else:
-                            TRACKED_STOCKS.add(sym)
-                            added.append(sym)
+                        TRACKED_STOCKS.add(sym)
+                        added.append(sym)
                     else:
                         invalid.append(sym)
                 else:
                     invalid.append(sym)
+            if added:
+                save_stocks()
             USER_STATE.pop(uid)
             if added:
                 await update.message.reply_text(f"✅ {', '.join(added)} added!")
@@ -364,9 +389,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ALERTS[sym][atype] = price
             save_alerts()
             USER_STATE.pop(uid)
-            await update.message.reply_text(
-                f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}"
-            )
+            await update.message.reply_text(f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}")
             await show_active_alerts(update)
             return
     if "Watchlist" in text:
@@ -379,16 +402,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sym in symbols:
             if 1 <= len(sym) <= 15:
                 if is_valid_nse_symbol(sym):
-                    p, pct, low, high = get_full_data(sym)
-                    if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
-                        invalid.append(sym)
-                    else:
-                        TRACKED_STOCKS.add(sym)
-                        added.append(sym)
+                    TRACKED_STOCKS.add(sym)
+                    added.append(sym)
                 else:
                     invalid.append(sym)
             else:
                 invalid.append(sym)
+        if added:
+            save_stocks()
         if added or invalid:
             if added:
                 await update.message.reply_text(f"✅ {', '.join(added)} added!")
@@ -402,7 +423,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     try:
-        requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=10)
+        SESSION.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True", timeout=10)
     except:
         pass
     clean_invalid_on_startup()
@@ -410,7 +431,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print("Bot Running - Final Fixed + strict validation + cleanup + del + webhook")
+    print(f"Bot Running - Optimized for 100+ stocks | {len(TRACKED_STOCKS)} tracked")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
