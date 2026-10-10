@@ -31,7 +31,7 @@ def load_stocks():
                 if data:
                     return set([s.upper() for s in data])
     except: pass
-    return set() # No defaults - empty stays empty
+    return set()
 
 ALERTS = load_alerts()
 TRACKED_STOCKS = load_stocks()
@@ -98,7 +98,7 @@ def get_multiple_data(symbols):
     return [(s, *results.get(s.upper(), (100.0, 0.0, 99.0, 101.0))) for s in symbols]
 
 def clean_invalid_on_startup():
-    if len(TRACKED_STOCKS) == 0: return # empty stays empty - no restore
+    if len(TRACKED_STOCKS) == 0: return
     to_remove = []
     for sym in list(TRACKED_STOCKS):
         if fetch_yahoo_raw(sym) is None:
@@ -214,9 +214,11 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if added: save_stocks()
                 if invalid and not added: USER_STATE[uid] = {"action": "add_stock"}
                 else: USER_STATE.pop(uid, None)
+                # Table FIRST, then messages AFTER
+                await show_positions(update)
                 if added: await update.message.reply_text(f"✅ {', '.join(added)} added!")
                 if invalid: await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
-                await show_positions(update); return
+                return
             elif text.replace(".", "", 1).isdigit():
                 sym = state["symbol"]; atype = state["action"]; price = float(text)
                 if sym not in ALERTS: ALERTS[sym] = {}
@@ -234,14 +236,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else: invalid.append(sym)
             if added: save_stocks()
             if added or invalid:
+                await show_positions(update)
                 if added: await update.message.reply_text(f"✅ {', '.join(added)} added!")
                 if invalid: await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
-                await show_positions(update)
     except Exception as e:
         print(f"menu error: {e}")
         try:
-            await update.message.reply_text(f"⚠️ No stock found: {text.upper()}\nPlease enter correct names again.")
             await show_positions(update)
+            await update.message.reply_text(f"⚠️ No stock found: {text.upper()}\nPlease enter correct names again.")
         except: pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,7 +257,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print(f"Bot Running - No Auto-Restore | {len(TRACKED_STOCKS)} tracked")
+    print(f"Bot Running - No Auto-Restore | Table First | {len(TRACKED_STOCKS)} tracked")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
