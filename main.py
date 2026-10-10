@@ -74,7 +74,7 @@ async def show_watchlist_menu(update: Update):
             txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
         )
 
-# SCREEN 1: 7 Columns Restored + Auto Adjust for YESBANK
+# SCREEN 1: 7 Columns + Auto Adjust
 async def show_positions(update: Update):
     stock_data = []
     for sym in TRACKED_STOCKS:
@@ -141,12 +141,8 @@ async def show_alert_options(update: Update, symbol):
     url_1d = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=D"
     kb = [
         [
-            InlineKeyboardButton(
-                "🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"
-            ),
-            InlineKeyboardButton(
-                "🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"
-            ),
+            InlineKeyboardButton("🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"),
+            InlineKeyboardButton("🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"),
         ],
         [
             InlineKeyboardButton("📈 15M", url=url_15m),
@@ -159,7 +155,6 @@ async def show_alert_options(update: Update, symbol):
         txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
     )
 
-# SCREEN 2: TDL TDH Added
 async def show_active_alerts(update: Update):
     if not ALERTS:
         txt = "⏰ No alerts. Tap 🔵 SYM → SetLowAlertPrice / SetHighAlertPrice"
@@ -182,9 +177,7 @@ async def show_active_alerts(update: Update):
     for sym, vals in ALERTS.items():
         p, _, tdl, tdh = get_full_data(sym)
         for atype, set_price in vals.items():
-            lines.append(
-                f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}"
-            )
+            lines.append(f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}")
     lines.append("```")
     full_text = "\n".join(lines)
     kb = [
@@ -209,46 +202,33 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
-    if d == "noop":
-        return
+    if d == "noop": return
     if d == "back_watchlist":
-        await show_watchlist_menu(update)
-        return
+        await show_watchlist_menu(update); return
     if d == "menu_positions":
-        await show_positions(update)
-        return
+        await show_positions(update); return
     if d == "menu_alerts":
-        await show_active_alerts(update)
-        return
+        await show_active_alerts(update); return
     if d == "add_stock":
         USER_STATE[q.from_user.id] = {"action": "add_stock"}
-        await q.edit_message_text(
-            "➕ *Add New Stock*\nSend symbol like: HDFC, TCS (comma suggested, ; also works)\nAny case: exideind, EXIDEIND", parse_mode="Markdown"
-        )
+        await q.edit_message_text("➕ *Add New Stock*\nSend like: HDFC, TCS (comma suggested, ; also works)\nAny case: exideind, EXIDEIND", parse_mode="Markdown")
         return
     if d == "sort_chg":
-        if SORT_MODE["mode"] == "default":
-            SORT_MODE["mode"] = "low_high"
-        elif SORT_MODE["mode"] == "low_high":
-            SORT_MODE["mode"] = "high_low"
-        else:
-            SORT_MODE["mode"] = "default"
-        await show_positions(update)
-        return
+        if SORT_MODE["mode"] == "default": SORT_MODE["mode"] = "low_high"
+        elif SORT_MODE["mode"] == "low_high": SORT_MODE["mode"] = "high_low"
+        else: SORT_MODE["mode"] = "default"
+        await show_positions(update); return
     if d == "cancel_set":
         USER_STATE.pop(q.from_user.id, None)
-        await show_positions(update)
-        return
+        await show_positions(update); return
     if d.startswith("del_"):
         sym = d.split("_")[1]
         TRACKED_STOCKS.discard(sym)
         ALERTS.pop(sym, None)
         save_alerts()
-        await show_positions(update)
-        return
+        await show_positions(update); return
     if d.startswith("stock_"):
-        await show_alert_options(update, d.split("_")[1])
-        return
+        await show_alert_options(update, d.split("_")[1]); return
     if d.startswith("setlow_") or d.startswith("sethigh_"):
         atype = "LOW" if "setlow" in d else "HIGH"
         sym = d.split("_")[1]
@@ -258,29 +238,14 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ltp = get_full_data(sym)[0]
         msg_lines = [f"✏️ Set new {atype}AlertPrice for {sym}", f"LTP: Rs.{ltp:.1f}", ""]
         if atype == "LOW":
-            if prev_low is not None:
-                msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f} (already set)")
-            else:
-                msg_lines.append(f"Prev Set Low Price: Not set yet")
-            if prev_high is not None:
-                msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f}")
+            msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f} (already set)" if prev_low is not None else "Prev Set Low Price: Not set yet")
+            if prev_high is not None: msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f}")
         else:
-            if prev_high is not None:
-                msg_lines.append(
-                    f"Prev Set High Price: Rs.{prev_high:.1f} (already set)"
-                )
-            else:
-                msg_lines.append(f"Prev Set High Price: Not set yet")
-            if prev_low is not None:
-                msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f}")
-        msg_lines.append("")
-        msg_lines.append("Send price like: 85.5")
+            msg_lines.append(f"Prev Set High Price: Rs.{prev_high:.1f} (already set)" if prev_high is not None else "Prev Set High Price: Not set yet")
+            if prev_low is not None: msg_lines.append(f"Prev Set Low Price: Rs.{prev_low:.1f}")
+        msg_lines.extend(["", "Send price like: 85.5"])
         kb = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_set")]]
-        await q.edit_message_text(
-            "\n".join(msg_lines),
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown",
-        )
+        await q.edit_message_text("\n".join(msg_lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +254,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in USER_STATE:
         state = USER_STATE[uid]
         if state["action"] == "add_stock":
-            # FIX: any case +, and ; support, comma suggested
+            # FIX: comma and semicolon, any case
             raw = text.replace(';', ',')
             symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
             added = []
@@ -306,26 +271,24 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sym = state["symbol"]
             atype = state["action"]
             price = float(text)
-            if sym not in ALERTS:
-                ALERTS[sym] = {}
+            if sym not in ALERTS: ALERTS[sym] = {}
             ALERTS[sym][atype] = price
             save_alerts()
             USER_STATE.pop(uid)
-            await update.message.reply_text(
-                f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}"
-            )
+            await update.message.reply_text(f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}")
             await show_active_alerts(update)
             return
     if "Watchlist" in text:
         await show_watchlist_menu(update)
     else:
-        # FIX: direct add also supports exideind, EXIDEIND, comma and semicolon
+        # FIX: direct add also any case +, and ;
         raw = text.replace(';', ',')
         symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
         valid = [s for s in symbols if 1 <= len(s) <= 15]
         if valid:
             for s in valid:
                 TRACKED_STOCKS.add(s)
+            await update.message.reply_text(f"✅ {', '.join(valid)} added!")
             await show_positions(update)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,7 +300,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print("Bot Running - OLD STYLE SAME + comma/semi anycase FIX")
+    print("Bot Running - OLD STYLE SAME + anycase,; fix")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
