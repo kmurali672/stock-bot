@@ -1,10 +1,10 @@
-import os, json, requests, time
+import os, json, requests, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "") # -100xxxx
+BACKUP_CHANNEL_ID = os.environ.get("BACKUP_CHANNEL_ID", "")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -17,6 +17,9 @@ CACHE = {}
 CACHE_TTL = 60
 MAX_WORKERS = 10
 
+# Ignore normal chat words - don't treat as stock
+IGNORE_WORDS = {"perfect","ok","okay","thanks","thank you","hi","hello","good","great","done","nice"}
+
 def backup_to_telegram():
     if not BACKUP_CHANNEL_ID or not BOT_TOKEN: return
     try:
@@ -26,9 +29,12 @@ def backup_to_telegram():
         if r.ok:
             msg_id = r.json()["result"]["message_id"]
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage", json={"chat_id": BACKUP_CHANNEL_ID, "message_id": msg_id}, timeout=8)
-            print(f"Backup pinned to {BACKUP_CHANNEL_ID}")
+            print(f"Backup pinned")
     except Exception as e:
         print(f"Backup fail {e}")
+
+def backup_in_background():
+    threading.Thread(target=backup_to_telegram, daemon=True).start()
 
 def restore_from_telegram():
     if not BACKUP_CHANNEL_ID or not BOT_TOKEN: return None
@@ -65,17 +71,23 @@ def load_stocks():
         return set([s.upper() for s in bk["stocks"]])
     return set()
 
-def save_alerts():
-    try:
-        with open(ALERTS_FILE, "w") as f: json.dump(ALERTS, f)
-    except: pass
-    backup_to_telegram()
-
-def save_stocks():
+def save_stocks_quick():
     try:
         with open(STOCKS_FILE, "w") as f: json.dump(list(TRACKED_STOCKS), f)
     except: pass
-    backup_to_telegram()
+
+def save_alerts_quick():
+    try:
+        with open(ALERTS_FILE, "w") as f: json.dump(ALERTS, f)
+    except: pass
+
+def save_stocks():
+    save_stocks_quick()
+    backup_in_background()
+
+def save_alerts():
+    save_alerts_quick()
+    backup_in_background()
 
 ALERTS = load_alerts()
 TRACKED_STOCKS = load_stocks()
@@ -145,7 +157,6 @@ async def show_positions(update: Update):
         else: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
-    # FAST PATH - instant from cache
     fetched = get_multiple_data_fast(list(TRACKED_STOCKS), use_cache_only=True)
     has_zero = any(p==0.0 for _, p, _, _, _ in fetched)
     stock_data = [(sym, p, pct, low, high) for sym, p, pct, low, high in fetched]
@@ -171,7 +182,6 @@ async def show_positions(update: Update):
     else:
         await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    # Background live fetch if cache empty - update same message
     if has_zero:
         try:
             fetched_real = get_multiple_data_fast(list(TRACKED_STOCKS), use_cache_only=False)
@@ -221,8 +231,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == "noop": return
     if d == "back_watchlist": await show_watchlist_menu(update); return
     if d == "menu_positions" or d == "refresh_prices":
-        if d == "refresh_prices":
-            CACHE.clear()
+        if d == "refresh_prices": CACHE.clear()
         await show_positions(update); return
     if d == "menu_alerts": await show_active_alerts(update); return
     if d == "add_stock": USER_STATE[q.from_user.id] = {"action": "add_stock"}; await q.edit_message_text("➕ *Add New Stock*\nSend like: HDFC, TCS", parse_mode="Markdown"); return
@@ -232,7 +241,16 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: SORT_MODE["mode"] = "default"
         await show_positions(update); return
     if d == "cancel_set": USER_STATE.pop(q.from_user.id, None); await show_positions(update); return
-    if d.startswith("del_"): sym = d[4:]; TRACKED_STOCKS.discard(sym); ALERTS.pop(sym, None); save_alerts(); save_stocks(); CACHE.pop(sym, None); await show_positions(update); return
+    if d.startswith("del_"):
+        sym = d[4:]
+        TRACKED_STOCKS.discard(sym)
+        ALERTS.pop(sym, None)
+        save_stocks_quick()
+        save_alerts_quick()
+        CACHE.pop(sym, None)
+        backup_in_background()
+        await show_positions(update)
+        return
     if d.startswith("stock_"): await show_alert_options(update, d.split("_")[1]); return
     if d.startswith("setlow_") or d.startswith("sethigh_"):
         atype = "LOW" if "setlow" in d else "HIGH"; sym = d.split("_")[1]
@@ -248,6 +266,9 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.message.from_user.id; raw_text = update.message.text.strip(); up_text = raw_text.upper()
+        if not raw_text: return
+        if raw_text.lower() in IGNORE_WORDS:
+            return
         if up_text in ["/START", "START"]: USER_STATE.pop(uid, None); await start(update, context); return
         if "WATCHLIST" in up_text: USER_STATE.pop(uid, None); await show_watchlist_menu(update); return
         if uid in USER_STATE:
@@ -268,7 +289,8 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}"); await show_active_alerts(update); return
         raw = raw_text.replace(';', ','); symbols = [s.strip().upper().replace(".NS","") for s in raw.split(',') if s.strip()]
         if not symbols: return
-        added = [s for s in symbols if 1 <= len(s) <= 15]
+        if len(symbols) == 1 and len(symbols[0]) > 15: return
+        added = [s for s in symbols if 1 <= len(s) <= 15 and s not in IGNORE_WORDS]
         for s in added: TRACKED_STOCKS.add(s)
         if added: save_stocks()
         if added:
@@ -291,7 +313,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print(f"Bot Running FAST - File + Telegram Backup | {len(TRACKED_STOCKS)} tracked | Backup: {BACKUP_CHANNEL_ID}")
+    print(f"Bot FAST Delete Fixed | {len(TRACKED_STOCKS)} tracked | Backup: {BACKUP_CHANNEL_ID}")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
