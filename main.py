@@ -57,6 +57,31 @@ def get_full_data(symbol):
     except:
         return 100.0, 0.0, 99.0, 101.0
 
+# NEW: Only for validation - does not change your old get_full_data
+def is_valid_nse_symbol(symbol):
+    try:
+        sym = f"{symbol.upper()}.NS"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            params={"range": "1d", "interval": "1m"},
+            timeout=10,
+        ).json()
+        res = r.get("chart", {}).get("result")
+        if not res:
+            return False
+        meta = res[0].get("meta", {})
+        if meta.get("regularMarketPrice") is None:
+            return False
+        # Yahoo returns empty if invalid symbol
+        if meta.get("previousClose") is None and meta.get("regularMarketDayLow") is None:
+            # still check price exists
+            pass
+        return True
+    except:
+        return False
+
 async def show_watchlist_menu(update: Update):
     kb = [
         [
@@ -74,7 +99,6 @@ async def show_watchlist_menu(update: Update):
             txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
         )
 
-# SCREEN 1: 7 Columns Restored + Auto Adjust for YESBANK
 async def show_positions(update: Update):
     stock_data = []
     for sym in TRACKED_STOCKS:
@@ -159,7 +183,6 @@ async def show_alert_options(update: Update, symbol):
         txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
     )
 
-# SCREEN 2: TDL TDH Added
 async def show_active_alerts(update: Update):
     if not ALERTS:
         txt = "⏰ No alerts. Tap 🔵 SYM → SetLowAlertPrice / SetHighAlertPrice"
@@ -240,7 +263,7 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_positions(update)
         return
     if d.startswith("del_"):
-        sym = d.split("_")[1]
+        sym = d[4:] # FIXED: robust delete
         TRACKED_STOCKS.discard(sym)
         ALERTS.pop(sym, None)
         save_alerts()
@@ -289,17 +312,24 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in USER_STATE:
         state = USER_STATE[uid]
         if state["action"] == "add_stock":
-            # FIXED: comma and semicolon, any case
             raw = text.replace(';', ',')
             symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
             added = []
+            invalid = []
             for sym in symbols:
                 if 1 <= len(sym) <= 15:
-                    TRACKED_STOCKS.add(sym)
-                    added.append(sym)
+                    if is_valid_nse_symbol(sym):
+                        TRACKED_STOCKS.add(sym)
+                        added.append(sym)
+                    else:
+                        invalid.append(sym)
+                else:
+                    invalid.append(sym)
             USER_STATE.pop(uid)
             if added:
                 await update.message.reply_text(f"✅ {', '.join(added)} added!")
+            if invalid:
+                await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
             await show_positions(update)
             return
         elif text.replace(".", "", 1).isdigit():
@@ -319,14 +349,24 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Watchlist" in text:
         await show_watchlist_menu(update)
     else:
-        # FIXED: direct typing also supports comma, semicolon, any case
         raw = text.replace(';', ',')
         symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
-        valid = [s for s in symbols if 1 <= len(s) <= 15]
-        if valid:
-            for s in valid:
-                TRACKED_STOCKS.add(s)
-            await update.message.reply_text(f"✅ {', '.join(valid)} added!")
+        added = []
+        invalid = []
+        for sym in symbols:
+            if 1 <= len(sym) <= 15:
+                if is_valid_nse_symbol(sym):
+                    TRACKED_STOCKS.add(sym)
+                    added.append(sym)
+                else:
+                    invalid.append(sym)
+            else:
+                invalid.append(sym)
+        if added or invalid:
+            if added:
+                await update.message.reply_text(f"✅ {', '.join(added)} added!")
+            if invalid:
+                await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
             await show_positions(update)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,7 +378,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print("Bot Running - Fixed + All 3 screens")
+    print("Bot Running - Fixed + validation + del fix")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
