@@ -21,12 +21,12 @@ STOCKS_FILE = "stocks.json"
 USER_STATE = {}
 SORT_MODE = {"mode": "default"}
 
-# --- OPTIMIZATION ---
+# --- OPTIMIZATION FOR 100+ STOCKS ---
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-CACHE = {} # sym -> (timestamp, price, pct, low, high)
-CACHE_TTL = 60 # seconds
-MAX_WORKERS = 20 # for 100+ stocks
+CACHE = {}
+CACHE_TTL = 60
+MAX_WORKERS = 20
 
 def load_alerts():
     try:
@@ -64,7 +64,7 @@ def fetch_yahoo_raw(symbol):
     try:
         sym = f"{symbol.upper()}.NS"
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-        r = SESSION.get(url, params={"range": "1d", "interval": "1m"}, timeout=10)
+        r = SESSION.get(url, params={"range": "1d", "interval": "1m"}, timeout=15)
         data = r.json()
         chart = data.get("chart", {})
         if chart.get("error") is not None:
@@ -93,24 +93,20 @@ def get_full_data(symbol):
             return vals
     vals = fetch_yahoo_raw(sym)
     if vals is None:
-        return 100.0, 0.0, 99.0, 101.0 # dummy for invalid
+        return 100.0, 0.0, 99.0, 101.0
     CACHE[sym] = (now, vals)
     return vals
 
 def is_valid_nse_symbol(symbol):
-    # uses same fetch, but no dummy caching
     vals = fetch_yahoo_raw(symbol)
     if vals is None:
         return False
-    # cache it immediately for next use
     CACHE[symbol.upper()] = (time.time(), vals)
     return True
 
 def get_multiple_data(symbols):
-    # parallel fetch for 100+ stocks
     results = {}
     symbols = list(symbols)
-    # first take from cache
     to_fetch = []
     now = time.time()
     for s in symbols:
@@ -133,12 +129,10 @@ def get_multiple_data(symbols):
                         results[sym] = (100.0, 0.0, 99.0, 101.0)
                 except:
                     results[sym] = (100.0, 0.0, 99.0, 101.0)
-    # return in original order
     return [(s, *results.get(s.upper(), (100.0, 0.0, 99.0, 101.0))) for s in symbols]
 
 def clean_invalid_on_startup():
     to_remove = []
-    # check in parallel
     fetched = get_multiple_data(list(TRACKED_STOCKS))
     for sym, p, pct, low, high in fetched:
         if p == 100.0 and low == 99.0 and high == 101.0 and pct == 0.0:
@@ -160,18 +154,13 @@ async def show_watchlist_menu(update: Update):
     ]
     txt = "📋 *Watchlist Menu*"
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-        )
+        await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-        )
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def show_positions(update: Update):
     fetched = get_multiple_data(list(TRACKED_STOCKS))
     stock_data = [(sym, p, pct, low, high) for sym, p, pct, low, high in fetched]
-
     if SORT_MODE["mode"] == "low_high":
         stock_data.sort(key=lambda x: x[2])
         chg_label = "%CHG ↑"
@@ -181,7 +170,6 @@ async def show_positions(update: Update):
     else:
         stock_data.sort(key=lambda x: x[0])
         chg_label = "%CHG ↕️"
-
     kb = []
     kb.append([InlineKeyboardButton("➕ Add New Stock", callback_data="add_stock")])
     kb.append(
@@ -209,20 +197,14 @@ async def show_positions(update: Update):
             ]
         )
     kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")])
-    txt = f"📈 *My Positions* ({len(stock_data)} stocks) - Tap %CHG to sort"
+    txt = f"📈 *My Positions* ({len(stock_data)} stocks) - Tap %CHG to sort | Auto-adjusted for long names"
     if update.callback_query:
         try:
-            await update.callback_query.edit_message_text(
-                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         except:
-            await update.callback_query.message.reply_text(
-                txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-            )
+            await update.callback_query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        await update.message.reply_text(
-            txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-        )
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def show_alert_options(update: Update, symbol):
     p, pct, low, high = get_full_data(symbol)
@@ -231,20 +213,11 @@ async def show_alert_options(update: Update, symbol):
     url_1h = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=60"
     url_1d = f"https://in.tradingview.com/chart/?symbol=NSE:{symbol}&interval=D"
     kb = [
-        [
-            InlineKeyboardButton("🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"),
-            InlineKeyboardButton("🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}"),
-        ],
-        [
-            InlineKeyboardButton("📈 15M", url=url_15m),
-            InlineKeyboardButton("📈 1H", url=url_1h),
-            InlineKeyboardButton("📈 Daily", url=url_1d),
-        ],
+        [InlineKeyboardButton("🔻 SetLowAlertPrice", callback_data=f"setlow_{symbol}"), InlineKeyboardButton("🔺 SetHighAlertPrice", callback_data=f"sethigh_{symbol}")],
+        [InlineKeyboardButton("📈 15M", url=url_15m), InlineKeyboardButton("📈 1H", url=url_1h), InlineKeyboardButton("📈 Daily", url=url_1d)],
         [InlineKeyboardButton("⬅️ Back", callback_data="menu_positions")],
     ]
-    await update.callback_query.edit_message_text(
-        txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-    )
+    await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def show_active_alerts(update: Update):
     if not ALERTS:
@@ -256,22 +229,14 @@ async def show_active_alerts(update: Update):
             await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
     fetched_map = {sym: (p, tdl, tdh) for sym, p, _, tdl, tdh in get_multiple_data(list(ALERTS.keys()))}
-    lines = [
-        "⏰ *Active Alerts*",
-        "```",
-        f"{'SYM':<8} {'TYPE':<5} {'SET':<7} {'LTP':<7} {'TDL':<7} {'TDH':<7}",
-        "-" * 52,
-    ]
+    lines = ["⏰ *Active Alerts*", "```", f"{'SYM':<8} {'TYPE':<5} {'SET':<7} {'LTP':<7} {'TDL':<7} {'TDH':<7}", "-" * 52]
     for sym, vals in ALERTS.items():
         p, tdl, tdh = fetched_map.get(sym, (100.0, 99.0, 101.0))
         for atype, set_price in vals.items():
             lines.append(f"{sym:<8} {atype:<5} {set_price:<7.1f} {p:<7.1f} {tdl:<7.1f} {tdh:<7.1f}")
     lines.append("```")
     full_text = "\n".join(lines)
-    kb = [
-        [InlineKeyboardButton("🔄 Refresh", callback_data="menu_alerts")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")],
-    ]
+    kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="menu_alerts")], [InlineKeyboardButton("⬅️ Back", callback_data="back_watchlist")]]
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(full_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
@@ -353,13 +318,56 @@ async def btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    text = update.message.text.strip()
-    if uid in USER_STATE:
-        state = USER_STATE[uid]
-        if state["action"] == "add_stock":
+    try:
+        uid = update.message.from_user.id
+        text = update.message.text.strip()
+        if uid in USER_STATE:
+            state = USER_STATE[uid]
+            if state["action"] == "add_stock":
+                raw = text.replace(';', ',')
+                symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
+                added = []
+                invalid = []
+                for sym in symbols:
+                    if 1 <= len(sym) <= 15:
+                        if is_valid_nse_symbol(sym):
+                            TRACKED_STOCKS.add(sym)
+                            added.append(sym)
+                        else:
+                            invalid.append(sym)
+                    else:
+                        invalid.append(sym)
+                if added:
+                    save_stocks()
+                if invalid and not added:
+                    USER_STATE[uid] = {"action": "add_stock"}
+                else:
+                    USER_STATE.pop(uid, None)
+                if added:
+                    await update.message.reply_text(f"✅ {', '.join(added)} added!")
+                if invalid:
+                    await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
+                await show_positions(update)
+                return
+            elif text.replace(".", "", 1).isdigit():
+                sym = state["symbol"]
+                atype = state["action"]
+                price = float(text)
+                if sym not in ALERTS:
+                    ALERTS[sym] = {}
+                ALERTS[sym][atype] = price
+                save_alerts()
+                USER_STATE.pop(uid, None)
+                await update.message.reply_text(f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}")
+                await show_active_alerts(update)
+                return
+        if "Watchlist" in text:
+            await show_watchlist_menu(update)
+        else:
             raw = text.replace(';', ',')
             symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
+            if not symbols:
+                return
             added = []
             invalid = []
             for sym in symbols:
@@ -373,49 +381,19 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     invalid.append(sym)
             if added:
                 save_stocks()
-            USER_STATE.pop(uid)
-            if added:
-                await update.message.reply_text(f"✅ {', '.join(added)} added!")
-            if invalid:
-                await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
+            if added or invalid:
+                if added:
+                    await update.message.reply_text(f"✅ {', '.join(added)} added!")
+                if invalid:
+                    await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
+                await show_positions(update)
+    except Exception as e:
+        print(f"menu error: {e}")
+        try:
+            await update.message.reply_text(f"⚠️ No stock found: {text.upper()}\nPlease enter correct names again.")
             await show_positions(update)
-            return
-        elif text.replace(".", "", 1).isdigit():
-            sym = state["symbol"]
-            atype = state["action"]
-            price = float(text)
-            if sym not in ALERTS:
-                ALERTS[sym] = {}
-            ALERTS[sym][atype] = price
-            save_alerts()
-            USER_STATE.pop(uid)
-            await update.message.reply_text(f"✅ {atype}AlertPrice {sym} = Rs.{price:.1f}")
-            await show_active_alerts(update)
-            return
-    if "Watchlist" in text:
-        await show_watchlist_menu(update)
-    else:
-        raw = text.replace(';', ',')
-        symbols = [s.strip().upper().replace(".NS", "") for s in raw.split(',') if s.strip()]
-        added = []
-        invalid = []
-        for sym in symbols:
-            if 1 <= len(sym) <= 15:
-                if is_valid_nse_symbol(sym):
-                    TRACKED_STOCKS.add(sym)
-                    added.append(sym)
-                else:
-                    invalid.append(sym)
-            else:
-                invalid.append(sym)
-        if added:
-            save_stocks()
-        if added or invalid:
-            if added:
-                await update.message.reply_text(f"✅ {', '.join(added)} added!")
-            if invalid:
-                await update.message.reply_text(f"⚠️ No stock found: {', '.join(invalid)}\nPlease enter correct names again.")
-            await show_positions(update)
+        except:
+            pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot Ready! 📈")
@@ -431,7 +409,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(btn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
-    print(f"Bot Running - Optimized for 100+ stocks | {len(TRACKED_STOCKS)} tracked")
+    print(f"Bot Running - Final Optimized + NoResponse Fix | {len(TRACKED_STOCKS)} tracked")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
